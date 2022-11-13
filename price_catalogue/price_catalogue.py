@@ -1,4 +1,5 @@
 import os
+import sys
 
 import unidecode
 from pyspark.ml.feature import Tokenizer, StopWordsRemover, MinHashLSH, RegexTokenizer, NGram, \
@@ -10,7 +11,11 @@ from pyspark.sql.types import StructType, StructField, StringType, IntegerType, 
 
 spark = SparkSession.builder.config("spark.driver.host", "localhost").config("driver-memory", "10G").getOrCreate()
 
-CSV_DATA_PATH = "../data/notas_fiscais_sample.csv"
+# fix pycharm error: https://stackoverflow.com/questions/68705417/pycharm-error-java-io-ioexception-cannot-run-program-python3-createprocess
+os.environ['PYSPARK_PYTHON'] = sys.executable
+os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+
+CSV_DATA_PATH = "../data/notas_fiscais_amostra1.csv"
 CSV_DATA_PATH_10pc = "../data/notas_fiscais_10pc.csv"
 STOP_WORDS_PATH = "../resources/stopwords.txt"
 PRICE_CATALOGUE_PATH = "../data/price_catalogue.parquet"
@@ -49,7 +54,7 @@ def main():
 
     similarity_df = group_similar_descriptions(items_df, PRICE_CATALOGUE_PATH, 0.4)
 
-    similarity_df.show(n=10, truncate=False)
+    similarity_df.show(n=100, truncate=False)
 
     similarity_df.printSchema()
 
@@ -67,7 +72,7 @@ def create_or_load_parquet_dataframe(path: str, schema: str) -> DataFrame:
 
 
 def filter_columns(df: DataFrame) -> DataFrame:
-    return df.selectExpr("concat(de_item_in1, ' ', de_item_in2) as description",
+    return df.selectExpr("concat_ws(' ', de_unid_compra_in, de_item_in1, de_item_in2) as description",
                          "concat_ws('_', cd_municipio, dt_versao_orc, cd_orgao, trim(cd_unid_orc), nu_nota_empenho, nu_nf) as key",
                          "dt_emissao_ne as date",
                          "month(dt_emissao_ne) as month",
@@ -106,14 +111,19 @@ def prepare_description(df: DataFrame, description_col: str, stop_words_file_pat
 
     words_df = tokenizer.transform(wo_puctuation_df)
     clean_df = remover.transform(words_df)\
-        .withColumn("words_clean", F.concat_ws(" ", F.col("words_clean")))
+        .withColumn("words_clean", F.concat_ws(" ", F.col("words_clean")))\
+        .filter(F.length(F.trim(F.col("words_clean"))) >= 3)  # remove descriptions with length <= 3
     characters_df = regex_tokenizer.transform(clean_df)
     n_grams_df = trigrams.transform(characters_df)
 
-    return n_grams_df.drop("words", "words_clean", "tokens")
+    return n_grams_df.drop("words", "words_clean", "tokens", "characters")
 
 
-def group_similar_descriptions(df: DataFrame, price_catalogue_path: str, threshold: float) -> DataFrame:
+def group_similar_descriptions(df: DataFrame,
+                               price_catalogue_path: str,
+                               threshold: float,
+                               save_model: bool = False,
+                               load_model: bool = False) -> DataFrame:
 
     price_catalogue_schema = StructType([
         StructField("description", StringType(), True),
@@ -130,18 +140,25 @@ def group_similar_descriptions(df: DataFrame, price_catalogue_path: str, thresho
 
     price_catalogue_df = create_or_load_parquet_dataframe(price_catalogue_path, price_catalogue_schema)
 
+    htf_model_path = "models/htf"
+    mh_model_path = "models/mh_lsh"
+
     # create a hashing TF vectorizer using the n-grams to encode the descriptions
-    htf_vectorizer = HashingTF()\
+    htf_vectorizer = HashingTF().load(htf_model_path) if load_model else HashingTF()\
         .setInputCol("n_grams")\
         .setOutputCol("tf_vectors")\
-        .setNumFeatures(2**21)
+        .setNumFeatures(2**18)
 
-    vectorized_df = htf_vectorizer.transform(df)
-
-    mh = MinHashLSH()\
+    mh = MinHashLSH().load(mh_model_path) if load_model else MinHashLSH()\
         .setInputCol("tf_vectors")\
         .setOutputCol("hash")\
-        .setNumHashTables(15)
+        .setNumHashTables(5)
+
+    if save_model:
+        htf_vectorizer.save(htf_model_path)
+        mh.save(mh_model_path)
+
+    vectorized_df = htf_vectorizer.transform(df)
 
     mh_model = mh.fit(vectorized_df)
 
