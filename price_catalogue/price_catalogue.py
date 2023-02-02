@@ -1,13 +1,14 @@
 import os
 import sys
 
+import numpy as np
 import unidecode
 from pyspark.ml.feature import Tokenizer, StopWordsRemover, MinHashLSH, RegexTokenizer, NGram, \
     HashingTF
 from pyspark.ml.linalg import VectorUDT
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, ArrayType
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, ArrayType, FloatType
 
 spark = SparkSession.builder.config("spark.driver.host", "localhost").config("driver-memory", "10G").getOrCreate()
 
@@ -15,7 +16,7 @@ spark = SparkSession.builder.config("spark.driver.host", "localhost").config("dr
 os.environ['PYSPARK_PYTHON'] = sys.executable
 os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
 
-CSV_DATA_PATH = "../data/notas_fiscais_amostra1.csv"
+CSV_DATA_PATH = "../data/notas_fiscais_amostra.csv"
 CSV_DATA_PATH_10pc = "../data/notas_fiscais_10pc.csv"
 STOP_WORDS_PATH = "../resources/stopwords.txt"
 PRICE_CATALOGUE_PATH = "../data/price_catalogue.parquet"
@@ -44,22 +45,34 @@ def main():
     raw_df = spark.read.csv(path=CSV_DATA_PATH, header=True, schema=SCHEMA)
 
     items_df = raw_df.transform(lambda df: filter_columns(df)) \
-        .transform(lambda df: prepare_description(df, "description", STOP_WORDS_PATH))
+        .transform(lambda df: prepare_description(df, "description", STOP_WORDS_PATH))\
+        .transform(lambda df: compute_n_grams(df, 3))
 
     items_df.show(truncate=False)
 
-    # words_dictionary_df = update_words_dictionary(items_df, "description", WORDS_DICTIONARY_PATH)
+    similarity_flat_df, similarity_df = group_similar_descriptions(items_df, PRICE_CATALOGUE_PATH, 0.35)
 
-    # words_dictionary_df.show()
+    similarity_df.show(n=1500, truncate=False)
 
-    similarity_df = group_similar_descriptions(items_df, PRICE_CATALOGUE_PATH, 0.4)
+    similarity_flat_df.show(n=1500, truncate=False)
 
-    similarity_df.show(n=100, truncate=False)
+    similarity_flat_df.printSchema()
 
-    similarity_df.printSchema()
+    overpriced_items_df = find_overpriced_items(similarity_flat_df, similarity_df)
 
-    similarity_df.write.parquet(path="data/similarity_df.parquet", mode="overwrite")
+    overpriced_items_df.show(n=1500, truncate=False)
 
+    # similarity_df.write.parquet(path="data/similarity_df.parquet", mode="overwrite")
+
+
+def find_overpriced_items(df: DataFrame, price_catalogue_df: DataFrame) -> DataFrame:
+
+    median_df = price_catalogue_df.select("key", "median_price")
+
+    overpriced_items_df = df.join(median_df, df["hash_key"] == median_df["key"])\
+        .filter("price > 1.5 * median_price")
+
+    return overpriced_items_df
 
 def create_or_load_parquet_dataframe(path: str, schema: str) -> DataFrame:
     empty_rdd = spark.sparkContext.emptyRDD()
@@ -73,30 +86,43 @@ def create_or_load_parquet_dataframe(path: str, schema: str) -> DataFrame:
 
 def filter_columns(df: DataFrame) -> DataFrame:
     return df.selectExpr("concat_ws(' ', de_unid_compra_in, de_item_in1, de_item_in2) as description",
-                         "concat_ws('_', cd_municipio, dt_versao_orc, cd_orgao, trim(cd_unid_orc), nu_nota_empenho, nu_nf) as key",
+                         "concat_ws('_', cd_municipio, dt_versao_orc, cd_orgao, trim(cd_unid_orc), nu_nota_empenho, nu_nf, nu_item_seq_in) as key",
                          "dt_emissao_ne as date",
                          "month(dt_emissao_ne) as month",
                          "year(dt_emissao_ne) as year",
                          "nu_quant_comprada_in as qty",
-                         "vl_unit_item_in as price")\
-        .filter(F.col("description").isNotNull())
+                         "vl_unit_item_in as price")
 
 
 def prepare_description(df: DataFrame, description_col: str, stop_words_file_path: str) -> DataFrame:
+
     # remove punctuation and accents
-    wo_puctuation_df = df.withColumn(description_col, F.trim(F.lower(F.regexp_replace(F.regexp_replace(F.translate(F.col(description_col), "ÁÉÍÓÚáéíóúÀÈÌÒÙàèìòùÂÊÎÔÛâêîôûÃẼĨÕŨãẽĩõũÇç", "AEIOUaeiouAEIOUaeiouAEIOUaeiouAEIOUaeiouCc"),"""[^\sa-zA-Z0-9]""", " "), """(\s\s+)""", " "))))
+    wo_punctuation_df = df.filter(f"{description_col} is not null")\
+        .withColumn(description_col, F.trim(F.lower(F.regexp_replace(F.regexp_replace(
+        F.translate(F.col(description_col), "ÁÉÍÓÚáéíóúÀÈÌÒÙàèìòùÂÊÎÔÛâêîôûÃẼĨÕŨãẽĩõũÇç",
+                    "AEIOUaeiouAEIOUaeiouAEIOUaeiouAEIOUaeiouCc"), """[^\sa-zA-Z0-9]""", " "), """(\s\s+)""", " "))))
 
     # remove stop words
     stop_words = unidecode.unidecode(open(stop_words_file_path, encoding='utf-8').read().lower()).split(",")
 
-    tokenizer = Tokenizer()\
-        .setInputCol(description_col)\
+    tokenizer = Tokenizer() \
+        .setInputCol(description_col) \
         .setOutputCol("words")
 
-    remover = StopWordsRemover()\
-        .setInputCol("words")\
-        .setOutputCol("words_clean")\
+    remover = StopWordsRemover() \
+        .setInputCol("words") \
+        .setOutputCol("words_clean") \
         .setStopWords(stop_words)
+
+    words_df = tokenizer.transform(wo_punctuation_df)
+    clean_df = remover.transform(words_df) \
+        .withColumn("words_clean", F.concat_ws(" ", F.col("words_clean"))) \
+        .filter(F.length(F.trim(F.col("words_clean"))) >= 3)  # remove descriptions with length <= 3
+
+    return clean_df
+
+
+def compute_n_grams(clean_df: DataFrame, n: int) -> DataFrame:
 
     # create 5 grams
     regex_tokenizer = RegexTokenizer()\
@@ -105,18 +131,15 @@ def prepare_description(df: DataFrame, description_col: str, stop_words_file_pat
         .setPattern("")
 
     trigrams = NGram()\
-        .setN(3)\
+        .setN(n)\
         .setInputCol("characters")\
         .setOutputCol("n_grams")
 
-    words_df = tokenizer.transform(wo_puctuation_df)
-    clean_df = remover.transform(words_df)\
-        .withColumn("words_clean", F.concat_ws(" ", F.col("words_clean")))\
-        .filter(F.length(F.trim(F.col("words_clean"))) >= 3)  # remove descriptions with length <= 3
     characters_df = regex_tokenizer.transform(clean_df)
-    n_grams_df = trigrams.transform(characters_df)
+    n_grams_df = trigrams.transform(characters_df)\
+        .drop("words", "words_clean", "tokens", "characters")
 
-    return n_grams_df.drop("words", "words_clean", "tokens", "characters")
+    return n_grams_df
 
 
 def group_similar_descriptions(df: DataFrame,
@@ -168,7 +191,11 @@ def group_similar_descriptions(df: DataFrame,
         .selectExpr("datasetA.key as key",
                     "datasetB.key as similar_key")\
         .groupBy("key")\
-        .agg(F.min("similar_key").alias("min_key"))
+        .agg(F.min("similar_key").alias("min_key"))\
+        .select("min_key")\
+        .distinct()
+
+    min_similar_key_df.show(n=50, truncate=False)
 
     """
      root
@@ -200,23 +227,45 @@ def group_similar_descriptions(df: DataFrame,
      |    |    |-- element: vector (containsNull = true)
      |-- distCol: double (nullable = false)
     """
-    price_catalogue_df = similarity_df.join(min_similar_key_df, similarity_df["datasetA.key"] == min_similar_key_df["min_key"])\
-        .groupBy("datasetA.description")\
+    price_catalogue_flat_df = similarity_df\
+        .join(min_similar_key_df, similarity_df["datasetA.key"] == min_similar_key_df["min_key"])\
+        .selectExpr("min_key as hash_key",
+                    "datasetB.key as key",
+                    "datasetB.description as description",
+                    "datasetB.date as date",
+                    "datasetB.month as month",
+                    "datasetB.year as year",
+                    "datasetB.qty as qty",
+                    "datasetB.price as price",
+                    "datasetB.tf_vectors as tf_vectors",
+                    "datasetA.hash as hash",
+                    "distCol as dist"
+                    )\
+        .orderBy("hash_key")
+
+    array_min = F.udf(lambda x: float(np.min(x)), FloatType())
+    array_max = F.udf(lambda x: float(np.max(x)), FloatType())
+    array_mean = F.udf(lambda x: float(np.mean(x)), FloatType())
+    array_median = F.udf(lambda x: float(np.median(x)), FloatType())
+
+    price_catalogue_df = similarity_df\
+        .join(min_similar_key_df, similarity_df["datasetA.key"] == min_similar_key_df["min_key"])\
+        .groupBy("datasetA.key")\
         .agg(
             F.collect_list("distCol").alias("similar_items_dist"),
-            F.first("datasetA.key").alias("key"),
             F.first("datasetA.tf_vectors").alias("tf_vectors"),
             F.first("datasetA.hash").alias("hash"),
-            F.count("datasetB").alias("qty_similar_items"),
-            F.min(F.col("datasetB.price").cast("double")).alias("min_price"),
-            F.max(F.col("datasetB.price").cast("double")).alias("max_price"),
-            F.avg(F.col("datasetB.price").cast("double")).alias("mean_price"),
-            F.percentile_approx(F.col("datasetB.price").cast("double"), F.lit(0.5).cast("double"), F.lit(100).cast("int")).alias("median_price"),
+            F.first("datasetA.description").alias("description"),
             F.collect_list("datasetB.price").alias("price_list"),
-            F.collect_list("datasetB.description").alias("similar_items")
-        ).sort("key")
+            F.collect_list("datasetB.key").alias("similar_keys"),
+        )\
+        .withColumn("min_price", array_min("price_list")) \
+        .withColumn("max_price", array_max("price_list")) \
+        .withColumn("mean_price", array_mean("price_list")) \
+        .withColumn("median_price", array_median("price_list")) \
+        .withColumn("qt_similar_items", F.size("price_list"))
 
-    return price_catalogue_df
+    return price_catalogue_flat_df, price_catalogue_df
 
 
 if __name__ == '__main__':
