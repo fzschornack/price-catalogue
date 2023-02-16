@@ -50,7 +50,7 @@ def main():
 
     items_df.show(truncate=False)
 
-    similarity_flat_df, similarity_df = group_similar_descriptions(items_df, PRICE_CATALOGUE_PATH, 0.35)
+    similarity_flat_df, similarity_df = group_similar_descriptions(items_df, 0.35)
 
     similarity_df.show(n=1500, truncate=False)
 
@@ -67,25 +67,43 @@ def main():
 
 def find_overpriced_items(df: DataFrame, price_catalogue_df: DataFrame) -> DataFrame:
 
-    median_df = price_catalogue_df.select("key", "median_price")
+    price_catalogue_median_df = price_catalogue_df.select("description_hash_key", "median_price")
 
-    overpriced_items_df = df.join(median_df, df["hash_key"] == median_df["key"])\
+    overpriced_items_df = df.join(price_catalogue_median_df, df["description_hash_key"] == price_catalogue_median_df["description_hash_key"])\
         .filter("price > 1.5 * median_price")
 
     return overpriced_items_df
 
-def create_or_load_parquet_dataframe(path: str, schema: str) -> DataFrame:
-    empty_rdd = spark.sparkContext.emptyRDD()
-    df = spark.createDataFrame(data=empty_rdd, schema=schema)
+def create_or_load_parquet_dataframe() -> DataFrame:
+
+    path = PRICE_CATALOGUE_PATH
 
     if os.path.exists(path):
         df = spark.read.parquet(path)
+    else:
+        price_catalogue_schema = StructType([
+            StructField("key", StringType(), True),
+            StructField("tf_vectors", VectorUDT(), True),
+            StructField("hash", StringType(), True),
+            StructField("description", StringType(), True),
+            StructField("price_list", ArrayType(DoubleType()), True),
+            StructField("similar_keys", ArrayType(StringType()), True),
+            StructField("min_price", DoubleType(), True),
+            StructField("max_price", DoubleType(), True),
+            StructField("mean_price", DoubleType(), True),
+            StructField("median_price", DoubleType(), True),
+            StructField("qty_similar_items", IntegerType(), True)
+        ])
+
+        empty_rdd = spark.sparkContext.emptyRDD()
+        df = spark.createDataFrame(data=empty_rdd, schema=price_catalogue_schema)
 
     return df
 
 
 def filter_columns(df: DataFrame) -> DataFrame:
-    return df.selectExpr("concat_ws(' ', de_unid_compra_in, de_item_in1, de_item_in2) as description",
+    return df.selectExpr("concat_ws(' ', de_item_in1, de_item_in2) as description",
+                         "de_unid_compra_in as unit",
                          "concat_ws('_', cd_municipio, dt_versao_orc, cd_orgao, trim(cd_unid_orc), nu_nota_empenho, nu_nf, nu_item_seq_in) as key",
                          "dt_emissao_ne as date",
                          "month(dt_emissao_ne) as month",
@@ -119,7 +137,10 @@ def prepare_description(df: DataFrame, description_col: str, stop_words_file_pat
         .withColumn("words_clean", F.concat_ws(" ", F.col("words_clean"))) \
         .filter(F.length(F.trim(F.col("words_clean"))) >= 3)  # remove descriptions with length <= 3
 
-    return clean_df
+    # create a hash using the clean description
+    prepared_df = clean_df.withColumn("description_hash", F.hash(F.col("words_clean")))
+
+    return prepared_df
 
 
 def compute_n_grams(clean_df: DataFrame, n: int) -> DataFrame:
@@ -142,26 +163,18 @@ def compute_n_grams(clean_df: DataFrame, n: int) -> DataFrame:
     return n_grams_df
 
 
+def new_items(df: DataFrame,
+              price_catalogue_df: DataFrame) -> DataFrame:
+
+    price_catalogue_keys_df = price_catalogue_df.select(F.explode(F.col("similar_keys")).alias("key")).join(df, price_catalogue_df["key"])
+
+
 def group_similar_descriptions(df: DataFrame,
-                               price_catalogue_path: str,
                                threshold: float,
                                save_model: bool = False,
                                load_model: bool = False) -> DataFrame:
 
-    price_catalogue_schema = StructType([
-        StructField("description", StringType(), True),
-        StructField("hash", StringType(), True),
-        StructField("key", StringType(), True),
-        StructField("tf_vectors", VectorUDT(), True),
-        StructField("qty_similar_items", IntegerType(), True),
-        StructField("min_price", DoubleType(), True),
-        StructField("max_price", DoubleType(), True),
-        StructField("mean_price", DoubleType(), True),
-        StructField("median_price", DoubleType(), True),
-        StructField("median_price", ArrayType(DoubleType()), True)
-        ])
-
-    price_catalogue_df = create_or_load_parquet_dataframe(price_catalogue_path, price_catalogue_schema)
+    price_catalogue_df = create_or_load_parquet_dataframe()
 
     htf_model_path = "models/htf"
     mh_model_path = "models/mh_lsh"
@@ -187,20 +200,22 @@ def group_similar_descriptions(df: DataFrame,
 
     similarity_df: DataFrame = mh_model.approxSimilarityJoin(vectorized_df, vectorized_df, threshold)
 
-    min_similar_key_df = similarity_df\
-        .selectExpr("datasetA.key as key",
-                    "datasetB.key as similar_key")\
-        .groupBy("key")\
-        .agg(F.min("similar_key").alias("min_key"))\
-        .select("min_key")\
+    min_similar_description_hash_df = similarity_df\
+        .selectExpr("datasetA.description_hash",
+                    "datasetB.description_hash as similar_description_hash")\
+        .groupBy("description_hash")\
+        .agg(F.min("similar_description_hash").alias("min_description_hash"))\
+        .select("min_description_hash")\
         .distinct()
 
-    min_similar_key_df.show(n=50, truncate=False)
+    min_similar_description_hash_df.show(n=50, truncate=False)
 
     """
      root
      |-- datasetA: struct (nullable = false)
+     |    |-- description_hash: string (nullable = true)
      |    |-- description: string (nullable = true)
+     |    |-- unit: string (nullable = true)     
      |    |-- key: string (nullable = false)
      |    |-- date: date (nullable = true)
      |    |-- month: integer (nullable = true)
@@ -213,7 +228,9 @@ def group_similar_descriptions(df: DataFrame,
      |    |-- hash: array (nullable = true)
      |    |    |-- element: vector (containsNull = true)
      |-- datasetB: struct (nullable = false)
+     |    |-- description_hash: string (nullable = true)
      |    |-- description: string (nullable = true)
+     |    |-- unit: string (nullable = true)     
      |    |-- key: string (nullable = false)
      |    |-- date: date (nullable = true)
      |    |-- month: integer (nullable = true)
@@ -228,10 +245,12 @@ def group_similar_descriptions(df: DataFrame,
      |-- distCol: double (nullable = false)
     """
     price_catalogue_flat_df = similarity_df\
-        .join(min_similar_key_df, similarity_df["datasetA.key"] == min_similar_key_df["min_key"])\
-        .selectExpr("min_key as hash_key",
+        .join(min_similar_description_hash_df, similarity_df["datasetA.description_hash"] == min_similar_description_hash_df["min_description_hash"])\
+        .selectExpr("min_description_hash as description_hash_key",
                     "datasetB.key as key",
+                    "datasetB.description_hash as description_hash",
                     "datasetB.description as description",
+                    "datasetB.unit as unit",
                     "datasetB.date as date",
                     "datasetB.month as month",
                     "datasetB.year as year",
@@ -239,9 +258,10 @@ def group_similar_descriptions(df: DataFrame,
                     "datasetB.price as price",
                     "datasetB.tf_vectors as tf_vectors",
                     "datasetA.hash as hash",
+                    "datasetA.unit as reference_unit",
                     "distCol as dist"
                     )\
-        .orderBy("hash_key")
+        .orderBy("description_hash_key")
 
     array_min = F.udf(lambda x: float(np.min(x)), FloatType())
     array_max = F.udf(lambda x: float(np.max(x)), FloatType())
@@ -249,10 +269,9 @@ def group_similar_descriptions(df: DataFrame,
     array_median = F.udf(lambda x: float(np.median(x)), FloatType())
 
     price_catalogue_df = similarity_df\
-        .join(min_similar_key_df, similarity_df["datasetA.key"] == min_similar_key_df["min_key"])\
-        .groupBy("datasetA.key")\
+        .join(min_similar_description_hash_df, similarity_df["datasetA.description_hash"] == min_similar_description_hash_df["min_description_hash"])\
+        .groupBy("datasetA.description_hash")\
         .agg(
-            F.collect_list("distCol").alias("similar_items_dist"),
             F.first("datasetA.tf_vectors").alias("tf_vectors"),
             F.first("datasetA.hash").alias("hash"),
             F.first("datasetA.description").alias("description"),
@@ -263,7 +282,8 @@ def group_similar_descriptions(df: DataFrame,
         .withColumn("max_price", array_max("price_list")) \
         .withColumn("mean_price", array_mean("price_list")) \
         .withColumn("median_price", array_median("price_list")) \
-        .withColumn("qt_similar_items", F.size("price_list"))
+        .withColumn("qty_similar_items", F.size("price_list"))\
+        .withColumnRenamed("description_hash", "description_hash_key")
 
     return price_catalogue_flat_df, price_catalogue_df
 
